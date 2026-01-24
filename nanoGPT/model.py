@@ -31,64 +31,64 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.kv_cache = False
-        # self.full_k, self.full_v = None, None
-        self.register_buffer("full_k",torch.zeros(1, config.n_head, config.block_size, config.n_embd // config.n_head),persistent=False)
-        self.register_buffer("full_v",torch.zeros(1, config.n_head, config.block_size, config.n_embd // config.n_head),persistent=False)
-        self.cache_len = 0
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        self.kv_cache = True
+        
+        # 1. Initialize Buffers
+        self.register_buffer("full_k", torch.zeros(1, config.n_head, config.block_size, config.n_embd // config.n_head), persistent=False)
+        self.register_buffer("full_v", torch.zeros(1, config.n_head, config.block_size, config.n_embd // config.n_head), persistent=False)
+        
+        # 2. Initialize Counter (FIX ADDED HERE)
+        self.cache_len = 0 
+
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+
     def forward(self, x):
         B, T, C = x.size() 
 
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) 
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) 
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) 
 
         if self.kv_cache:
             if T > 1:
                 # === PREFILL ===
                 self.full_k[:, :, :T, :] = k
                 self.full_v[:, :, :T, :] = v
-                self.cache_len = T
+                self.cache_len = T  # Set counter to prompt length
+                
                 k_in, v_in = k, v 
                 Tout = T
             else:
                 # === DECODE ===
-                # Use the integer tracker 'cache_len' instead of count_nonzero
+                # FIX: Use the counter, NEVER use count_nonzero
                 start_pos = self.cache_len
+                
                 self.full_k[:, :, start_pos:start_pos+1, :] = k
                 self.full_v[:, :, start_pos:start_pos+1, :] = v
-                self.cache_len += 1
+                self.cache_len += 1 # Increment counter
                 
-                # Slice valid history
+                # Retrieve Valid Data
                 k_in = self.full_k[:, :, :self.cache_len, :]
                 v_in = self.full_v[:, :, :self.cache_len, :]
                 Tout = 1
         else:
-            # === NO CACHE ===
             k_in, v_in = k, v
             Tout = T 
 
         # --- ATTENTION ---
         if self.flash:
-            # FIX: 3rd argument must be v_in (Values), not k_in
             y = torch.nn.functional.scaled_dot_product_attention(
                 q, k_in, v_in, 
                 attn_mask=None, 
@@ -96,89 +96,19 @@ class CausalSelfAttention(nn.Module):
                 is_causal=True
             )
         else:
-            # FIX: Remove 'self.' and fix size reference
             att = (q @ k_in.transpose(-2, -1)) * (1.0 / math.sqrt(k_in.size(-1)))
             T_total = k_in.size(2)
 
-            if Tout > 1: # Only mask during prefill/training
+            if Tout > 1: 
                 att = att.masked_fill(self.bias[:,:,:T_total,:T_total] == 0, float('-inf'))
             
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v_in # FIX: Remove 'self.'
+            y = att @ v_in 
         
         y = y.transpose(1, 2).contiguous().view(B, Tout, C) 
         y = self.resid_dropout(self.c_proj(y))
         return y
-
-    # def forward(self, x):
-    #     # if self.kv_cache and self.full_k is not None:
-    #     #     x = x[:,[-1],:]
-    #     B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-    #     # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-
-    #     q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-    #     k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-    #     q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-    #     v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-    #     if self.kv_cache:
-    #         if T>1 :
-    #             self.full_k[:, :, :T, :] = k
-    #             self.full_v[:, :, :T, :] = v
-                
-    #             k_in, v_in = k, v # Use current k/v for attention
-    #             Tout = T
-    #         else:
-    #             start_pos = self.full_k.count_nonzero() // (B * self.n_head * (C // self.n_head))
-                
-    #             self.full_k[:, :, start_pos:start_pos+1, :] = k
-    #             self.full_v[:, :, start_pos:start_pos+1, :] = v
-                
-    #             k_in = self.full_k[:, :, :start_pos+1, :]
-    #             v_in = self.full_v[:, :, :start_pos+1, :]
-    #             Tout = 1
-    #     else:
-    #         k_in, v_in = k,v
-    #         Tout = T 
-
-        
-
-
-    #     # if self.kv_cache:
-    #     #     if self.full_k is None:
-    #     #         self.full_k = new_k
-    #     #         self.full_v = new_v
-    #     #     else:
-    #     #         self.full_k = torch.cat([self.full_k,new_k],dim=2)
-    #     #         self.full_v = torch.cat([self.full_v,new_v],dim=2)
-    #     # else:
-    #     #     self.full_k = new_k
-    #     #     self.full_v = new_v
-
-
-    #     # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-    #     if self.flash:
-    #         # efficient attention using Flash Attention CUDA kernels
-    #         y = torch.nn.functional.scaled_dot_product_attention(q, k_in, v_in, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-    #     else:
-    #         # manual implementation of attention
-    #         att = (q @ k_in.transpose(-2, -1)) * (1.0 / math.sqrt(k_in.size(-1)))
-    #         T_total = k_in.size(2)
-
-    #         if Tout ==1:
-    #             pass
-    #         else:
-    #             att = att.masked_fill(self.bias[:,:,:T_total,:T_total] == 0, float('-inf'))
-    #         att = F.softmax(att, dim=-1)
-    #         att = self.attn_dropout(att)
-    #         y = att @ v_in # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs) @ -> matmul in pytorch
-    #     y = y.transpose(1, 2).contiguous().view(B, Tout, C) # re-assemble all head outputs side by side
-
-    #     # output projection
-    #     y = self.resid_dropout(self.c_proj(y))
-    #     return y
-
 class MLP(nn.Module):
 
     def __init__(self, config):
