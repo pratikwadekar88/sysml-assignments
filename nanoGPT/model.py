@@ -31,84 +31,70 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.kv_cache = True
-        
-        # 1. Initialize Buffers
-        self.register_buffer("full_k", torch.zeros(1, config.n_head, config.block_size, config.n_embd // config.n_head), persistent=False)
-        self.register_buffer("full_v", torch.zeros(1, config.n_head, config.block_size, config.n_embd // config.n_head), persistent=False)
-        
-        # 2. Initialize Counter (FIX ADDED HERE)
-        self.cache_len = 0 
-
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        
+        self.use_cache = False
+        self.cache_k = None
+        self.cache_v = None
+
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
+    def reset_cache(self):
+        self.cache_k = None
+        self.cache_v = None
+
     def forward(self, x):
-        B, T, C = x.size() 
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) 
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) 
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) 
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        if self.kv_cache:
-            if T > 1:
-                # === PREFILL ===
-                self.full_k[:, :, :T, :] = k
-                self.full_v[:, :, :T, :] = v
-                self.cache_len = T  # Set counter to prompt length
-                
-                k_in, v_in = k, v 
-                Tout = T
-            else:
-                # === DECODE ===
-                # FIX: Use the counter, NEVER use count_nonzero
-                start_pos = self.cache_len
-                
-                self.full_k[:, :, start_pos:start_pos+1, :] = k
-                self.full_v[:, :, start_pos:start_pos+1, :] = v
-                self.cache_len += 1 # Increment counter
-                
-                # Retrieve Valid Data
-                k_in = self.full_k[:, :, :self.cache_len, :]
-                v_in = self.full_v[:, :, :self.cache_len, :]
-                Tout = 1
-        else:
-            k_in, v_in = k, v
-            Tout = T 
-
-        # --- ATTENTION ---
-        if self.flash:
-            y = torch.nn.functional.scaled_dot_product_attention(
-                q, k_in, v_in, 
-                attn_mask=None, 
-                dropout_p=self.dropout if self.training else 0, 
-                is_causal=True
-            )
-        else:
-            att = (q @ k_in.transpose(-2, -1)) * (1.0 / math.sqrt(k_in.size(-1)))
-            T_total = k_in.size(2)
-
-            if Tout > 1: 
-                att = att.masked_fill(self.bias[:,:,:T_total,:T_total] == 0, float('-inf'))
+        if self.use_cache:
+            if self.cache_k is not None:
+                k = torch.cat((self.cache_k,k),dim=2)
+                v = torch.cat((self.cache_v,v),dim=2)
             
+            self.cache_k = k
+            self.cache_v = v
+        T_ctx = k.size(2)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        if self.flash:
+            # efficient attention using Flash Attention CUDA kernels
+            is_causal = (T==T_ctx)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=is_causal)
+        else:
+            # manual implementation of attention
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v_in 
-        
-        y = y.transpose(1, 2).contiguous().view(B, Tout, C) 
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
+
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -135,7 +121,6 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        # x = (B, t, n_embd)
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
@@ -181,9 +166,6 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
-    def clear_kv_cache(self):
-        for block in self.transformer.h:
-            block.attn.cache_len = 0
 
     def get_num_params(self, non_embedding=True):
         """
@@ -205,17 +187,16 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None,start_pos=0):
+    def forward(self, idx, targets=None,pos_offset=0):
         device = idx.device
         b, t = idx.size()
-        assert start_pos+t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        # pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-        pos = torch.arange(start_pos, start_pos+t,dtype=torch.long, device=device)
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(pos_offset, pos_offset +t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb) # (b, t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -272,8 +253,6 @@ class GPT(nn.Module):
         sd = model.state_dict()
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.full_k')] # <--- ADD THIS
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.full_v')] # <--- ADD THIS
 
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
@@ -344,95 +323,45 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        # 1. Check if KV Cache is enabled
-        use_cache = self.transformer.h[0].attn.kv_cache
-
-        # --- PATH A: NO CACHE (Standard/Slow) ---
-        if not use_cache:
-            for _ in range(max_new_tokens):
-                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-                logits, _ = self(idx_cond) # Feed FULL history
-                logits = logits[:, -1, :] / temperature
-                
-                if top_k is not None:
-                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = -float('Inf')
-                probs = F.softmax(logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1)
-                idx = torch.cat((idx, idx_next), dim=1)
-            return idx
-
-        # --- PATH B: KV CACHE (Fast) ---
-        # Phase 1: Prefill (Process Prompt)
-        idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-        logits, _ = self(idx_cond)
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None,use_cache=False):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        if use_cache:
+            for block in self.transformer.h:
+                block.attn.use_cache = True
+                block.attn.reset_cache()
         
-        logits = logits[:, -1, :] / temperature
-        if top_k is not None:
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            logits[logits < v[:, [-1]]] = -float('Inf')
-        probs = F.softmax(logits, dim=-1)
-        idx_next = torch.multinomial(probs, num_samples=1)
+        curr_pos = 0
+        for _ in range(max_new_tokens):
 
-        idx_full = torch.cat([idx, idx_next], dim=1)
+            if use_cache and _>0:
+                idx_cond = idx[:,[-1]]
+                pos_offset  = curr_pos
+            else:
+                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+                pos_offset = 0
+            # forward the model to get the logits for the index in the sequence
+            curr_pos += idx_cond.size(1)
 
-        # Phase 2: Decode Loop (Process 1 token at a time)
-        for _ in range(max_new_tokens - 1):
-            curr_pos = idx_full.size(1) - 1
-            
-            # Feed SINGLE token + start_pos
-            logits, _ = self(idx_next, start_pos=curr_pos)
-            
+            logits, _ = self(idx_cond,pos_offset=pos_offset)
+            # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
-            idx_full = torch.cat((idx_full, idx_next), dim=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
+        if use_cache:
+            for block in self.transformer.h:
+                block.attn.use_cache = False
+                block.attn.reset_cache()
 
-        return idx_full
-    # def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-    #     """
-    #     Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-    #     the sequence max_new_tokens times, feeding the predictions back into the model each time.
-    #     Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-    #     """
-                
-    #     idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-    #     # forward the model to get the logits for the index in the sequence
-    #     logits, _ = self(idx_cond)
-    #     # pluck the logits at the final step and scale by desired temperature
-    #     logits = logits[:, -1, :] / temperature
-    #     # optionally crop the logits to only the top k options
-    #     if top_k is not None:
-    #         v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-    #         logits[logits < v[:, [-1]]] = -float('Inf')
-    #     # apply softmax to convert logits to (normalized) probabilities
-    #     probs = F.softmax(logits, dim=-1)
-    #     # sample from the distribution
-    #     idx_next = torch.multinomial(probs, num_samples=1)
-
-    #     idx_full = torch.cat([idx,idx_next],dim=1)
-
-    #     # append sampled index to the running sequence and continue
-    #     idx = torch.cat((idx, idx_next), dim=1)
-    #     for _ in range(max_new_tokens-1):
-    #         # if the sequence context is growing too long we must crop it at block_size
-    #         curr_pos = idx_full.size(1) -1
-
-    #         logits, _ = self(idx_next,start_pos=curr_pos)
-    #         logits = logits[:, -1, :] / temperature
-            
-    #         if top_k is not None:
-    #             v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-    #             logits[logits < v[:, [-1]]] = -float('Inf')
-    #         # apply softmax to convert logits to (normalized) probabilities
-    #         probs = F.softmax(logits, dim=-1)
-    #         # sample from the distribution
-    #         idx_next = torch.multinomial(probs, num_samples=1)
-    #         # append sampled index to the running sequence and continue
-    #         idx_full = torch.cat((idx_full , idx_next), dim=1)
-
-    #     return idx_full
+        return idx
