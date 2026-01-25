@@ -335,9 +335,9 @@ class GPT(nn.Module):
                 block.attn.reset_cache()
         
         curr_pos = 0
-        for _ in range(max_new_tokens):
+        for i in range(max_new_tokens):
 
-            if use_cache and _>0:
+            if use_cache and i >0:
                 idx_cond = idx[:,[-1]]
                 pos_offset  = curr_pos
             else:
