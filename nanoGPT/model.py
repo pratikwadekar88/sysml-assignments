@@ -332,7 +332,7 @@ class GPT(nn.Module):
         if use_cache:
             for block in self.transformer.h:
                 block.attn.use_cache = True
-                block.attn.reset_cache()
+                # block.attn.reset_cache()
         
         curr_pos = 0
         for i in range(max_new_tokens):
