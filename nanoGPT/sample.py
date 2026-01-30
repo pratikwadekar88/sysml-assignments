@@ -181,8 +181,10 @@ def build_kv_cache_for_tree(model, node, parent_kv=None):
 
     # 2. ONLY process token if this node actually has one
     if node.token is not None:
+        parent_prefix_len = max(0, node.depth - 1)
         idx = torch.tensor([[node.token]], dtype=torch.long, device=device)
-        _ = model(idx)  # builds KV for this token
+        _ = model(idx,pos_offset=parent_prefix_len)  # builds KV for this token
+
 
     # 3. Store KV cache at this node
     node.kv_cache = get_current_kv_cache(model)
@@ -242,12 +244,12 @@ def process_prompt_only(model, prompt_tokens):
     # KV cache is now populated inside the model
 
 def generate_from_cached_kv(model, leaf_node, prompt_tokens):
-    # 1. Load KV cache from radix tree
+    # Load KV cache for full prompt
     load_kv_cache(model, leaf_node.kv_cache)
 
-    # 2. Start generation from last prompt token
-    last_token = prompt_tokens[-1]
-    idx = torch.tensor([[last_token]], device=device)
+    # nanoGPT requires at least 1 token to start generation.
+    # Provide last token as trigger, then drop it from the output.
+    idx = torch.tensor([[prompt_tokens[-1]]], device=device)
 
     y = model.generate(
         idx,
@@ -257,8 +259,8 @@ def generate_from_cached_kv(model, leaf_node, prompt_tokens):
         use_cache=True
     )
 
-    return prompt_tokens + y[0].tolist()
-
+    # drop duplicated seed token from generation
+    return prompt_tokens + y[0].tolist()[1:]
 
 
 with torch.no_grad():
