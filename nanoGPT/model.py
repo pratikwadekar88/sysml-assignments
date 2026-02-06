@@ -44,7 +44,6 @@ class CausalSelfAttention(nn.Module):
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         
-        self.use_cache = False
         self.cache_k = None
         self.cache_v = None
 
@@ -67,13 +66,14 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        if self.use_cache:
-            if self.cache_k is not None:
-                k = torch.cat((self.cache_k,k),dim=2)
-                v = torch.cat((self.cache_v,v),dim=2)
+        if self.cache_k is not None:
+            k = torch.cat((self.cache_k,k),dim=2)
+            v = torch.cat((self.cache_v,v),dim=2)
+
+
             
-            self.cache_k = k
-            self.cache_v = v
+        self.cache_k = k
+        self.cache_v = v
         T_ctx = k.size(2)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
@@ -323,21 +323,19 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None,use_cache=False):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
-        if use_cache:
-            for block in self.transformer.h:
-                block.attn.use_cache = True
-                block.attn.reset_cache()
+        for block in self.transformer.h:
+            block.attn.reset_cache()
         
         curr_pos = 0
         for i in range(max_new_tokens):
 
-            if use_cache and i >0:
+            if i >0:
                 idx_cond = idx[:,[-1]]
                 pos_offset  = curr_pos
             else:
@@ -359,9 +357,6 @@ class GPT(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
-        if use_cache:
-            for block in self.transformer.h:
-                block.attn.use_cache = False
-                block.attn.reset_cache()
+        
 
         return idx
