@@ -68,6 +68,8 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         if self.use_cache:
+            # NOTE: Dynamic concatenation with torch.cat allocates a new tensor on each generation step.
+            # In high-performance systems, pre-allocated static KV cache buffers are preferred to avoid allocation overhead.
             if self.cache_k is not None:
                 k = torch.cat((self.cache_k,k),dim=2)
                 v = torch.cat((self.cache_v,v),dim=2)
@@ -79,12 +81,18 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
+            # is_causal is True for initial prompt prefill (T == T_ctx). For single token generation (T = 1 < T_ctx),
+            # is_causal is set to False so the single query token can attend across all T_ctx historical keys/values.
             is_causal = (T==T_ctx)
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=is_causal)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
 
+            # NOTE / LOGIC CHECK: For single token generation (T = 1), self.bias[:,:,:1,:1] is [[[[1]]]] (unmasked),
+            # which allows the new query token to attend to all T_ctx cached key positions.
+            # Note that if 1 < T < T_ctx (e.g. chunked prefill), self.bias[:,:,:T,:T] shape (1,1,T,T)
+            # would fail to broadcast with att shape (B, nh, T, T_ctx).
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
@@ -190,7 +198,8 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None,pos_offset=0):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        # LOGIC CHECK: Ensure total position index (pos_offset + t) does not exceed max context window block_size
+        assert pos_offset + t <= self.config.block_size, f"Cannot forward sequence ending at position {pos_offset + t}, block size is only {self.config.block_size}"
         pos = torch.arange(pos_offset, pos_offset +t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
