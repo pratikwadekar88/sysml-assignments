@@ -4,6 +4,15 @@
 
 using namespace std;
 
+// d_m holds the running row max for the online softmax. Every row must start
+// at -infinity before the first K/V tile is processed; cudaMalloc does not
+// zero-initialize, and 0.0 is not a valid starting max (it would silently
+// clip away any negative Q.K scores from the first tile).
+__global__ void init_neg_inf(float* m, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) m[idx] = -1e20f;
+}
+
 __global__ void flash_attention_kernel(
     const float* Q, const float* K, const float* V, float* O, 
     float* m, float* l, 
@@ -117,7 +126,7 @@ __global__ void flash_attention_kernel(
             }
         }
         
-        __syncthreads(  ; // BARRIER 2: prevent overwriting K/V in shared memory before all inner loops finish
+        __syncthreads(); // BARRIER 2: prevent overwriting K/V in shared memory before all inner loops finish
     }
 }
 
@@ -247,6 +256,7 @@ int main(int argc, char *argv[]) {
     // Initialize O and l on device [cite: 90]
     cudaMemset(d_O, 0, qkv_size);
     cudaMemset(d_l, 0, lm_size);
+    init_neg_inf<<<(B * NH * N + 255) / 256, 256>>>(d_m, B * NH * N);
 
     // Define grid and block dimensions 
     dim3 grid(B, NH); // total of B*NH thread blocks [cite: 32, 33]

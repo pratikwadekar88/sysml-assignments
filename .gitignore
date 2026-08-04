@@ -10,3 +10,4 @@ nanoGPT/__pycache__/
 nanoGPT/input.txt
 env/
 venv/
+.venv/
