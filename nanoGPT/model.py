@@ -77,23 +77,35 @@ class CausalSelfAttention(nn.Module):
             self.cache_k = k
             self.cache_v = v
         T_ctx = k.size(2)
+        # P = number of "past" (already-cached) key positions before this chunk's own T
+        # tokens. Query row i (0-indexed within the chunk) is allowed to see key columns
+        # 0..P+i, i.e. a lower-triangular band offset by P. This single formula covers all
+        # three cases the generation loop hits: full prefill (P=0, T=T_ctx -> standard
+        # causal), single-token decode (T=1, P=T_ctx-1 -> fully unmasked row), and chunked
+        # prefill / radix-tree suffix processing (1 < T < T_ctx -> rectangular band mask).
+        P = T_ctx - T
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            # is_causal is True for initial prompt prefill (T == T_ctx). For single token generation (T = 1 < T_ctx),
-            # is_causal is set to False so the single query token can attend across all T_ctx historical keys/values.
-            is_causal = (T==T_ctx)
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=is_causal)
+            if T == T_ctx:
+                # full prefill: use the fused causal path
+                y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            elif T == 1:
+                # single-token decode: query attends to every cached key, unmasked
+                y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=False)
+            else:
+                # chunked prefill: is_causal=True would apply a square mask aligned to the
+                # wrong corner (it assumes T==T_ctx), letting suffix tokens see future
+                # suffix tokens. Build the explicit rectangular band mask instead.
+                attn_mask = torch.ones(T, T_ctx, dtype=torch.bool, device=x.device).tril(diagonal=P)
+                y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0, is_causal=False)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
 
-            # NOTE / LOGIC CHECK: For single token generation (T = 1), self.bias[:,:,:1,:1] is [[[[1]]]] (unmasked),
-            # which allows the new query token to attend to all T_ctx cached key positions.
-            # Note that if 1 < T < T_ctx (e.g. chunked prefill), self.bias[:,:,:T,:T] shape (1,1,T,T)
-            # would fail to broadcast with att shape (B, nh, T, T_ctx).
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            mask = torch.ones(T, T_ctx, dtype=torch.bool, device=x.device).tril(diagonal=P)
+            att = att.masked_fill(~mask, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -331,19 +343,39 @@ class GPT(nn.Module):
         mfu = flops_achieved / flops_promised
         return mfu
 
+    def get_kv_cache(self):
+        """Snapshot the per-block (cache_k, cache_v) tensors, e.g. to stash a radix-tree
+        node's cache after processing its chunk so it can be restored for a sibling."""
+        return [(block.attn.cache_k, block.attn.cache_v) for block in self.transformer.h]
+
+    def set_kv_cache(self, kv_list):
+        """Restore a previously-snapshotted per-block KV cache (see get_kv_cache) and turn
+        caching on. kv_list entries may be (None, None) for an empty (root) cache."""
+        for block, (k, v) in zip(self.transformer.h, kv_list):
+            block.attn.use_cache = True
+            block.attn.cache_k = k
+            block.attn.cache_v = v
+
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None,use_cache=False):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_cache=False, greedy=False, pos_start=0):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+
+        pos_start: position offset of idx[:, 0] in the underlying sequence. Nonzero when a KV
+        cache for a shared prefix (see get_kv_cache/set_kv_cache) is already loaded into the
+        blocks before this call, e.g. by the radix-tree shared-prefix generation path.
+        greedy: if True, always pick the argmax token instead of sampling (deterministic,
+        used to verify radix-shared and independent generation produce identical output).
         """
         if use_cache:
             for block in self.transformer.h:
                 block.attn.use_cache = True
-                block.attn.reset_cache()
-        
-        curr_pos = 0
+                if pos_start == 0:
+                    block.attn.reset_cache()
+
+        curr_pos = pos_start
         for i in range(max_new_tokens):
 
             if use_cache and i >0:
@@ -351,7 +383,7 @@ class GPT(nn.Module):
                 pos_offset  = curr_pos
             else:
                 idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-                pos_offset = 0
+                pos_offset = pos_start
             # forward the model to get the logits for the index in the sequence
             curr_pos += idx_cond.size(1)
 
@@ -362,10 +394,13 @@ class GPT(nn.Module):
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
+            if greedy:
+                idx_next = logits.argmax(dim=-1, keepdim=True)
+            else:
+                # apply softmax to convert logits to (normalized) probabilities
+                probs = F.softmax(logits, dim=-1)
+                # sample from the distribution
+                idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
         if use_cache:

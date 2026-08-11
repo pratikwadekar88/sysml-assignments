@@ -1,0 +1,36 @@
+Running device=cpu strategy=radix-shared prefix_len=32
+number of parameters: 123.69M
+RESULT_JSON:{"device": "cpu", "strategy": "radix-shared", "num_prompts": 8, "prefix_len": 32, "suffix_len": 16, "output_len": 4, "repeats": 5, "mean_ms": 494.2206736002845, "std_ms": 9.227074187891319, "min_ms": 487.1176460001152, "max_ms": 508.18695000089065}
+Running device=cpu strategy=radix-shared prefix_len=128
+number of parameters: 123.69M
+RESULT_JSON:{"device": "cpu", "strategy": "radix-shared", "num_prompts": 8, "prefix_len": 128, "suffix_len": 16, "output_len": 4, "repeats": 5, "mean_ms": 576.378936400215, "std_ms": 20.235918436177965, "min_ms": 557.1113870009867, "max_ms": 603.0281679995824}
+Running device=cpu strategy=radix-shared prefix_len=256
+number of parameters: 123.69M
+RESULT_JSON:{"device": "cpu", "strategy": "radix-shared", "num_prompts": 8, "prefix_len": 256, "suffix_len": 16, "output_len": 4, "repeats": 5, "mean_ms": 752.3020784003165, "std_ms": 30.496268671249737, "min_ms": 723.8462660006917, "max_ms": 786.741568999787}
+Running device=cpu strategy=independent prefix_len=32
+number of parameters: 123.69M
+RESULT_JSON:{"device": "cpu", "strategy": "independent", "num_prompts": 8, "prefix_len": 32, "suffix_len": 16, "output_len": 4, "repeats": 5, "mean_ms": 572.451245800039, "std_ms": 11.155896425130452, "min_ms": 559.203532000538, "max_ms": 587.804906999736}
+Running device=cpu strategy=independent prefix_len=128
+number of parameters: 123.69M
+RESULT_JSON:{"device": "cpu", "strategy": "independent", "num_prompts": 8, "prefix_len": 128, "suffix_len": 16, "output_len": 4, "repeats": 5, "mean_ms": 1032.7360337996652, "std_ms": 25.464212920411388, "min_ms": 998.711481999635, "max_ms": 1060.9206069984793}
+Running device=cpu strategy=independent prefix_len=256
+number of parameters: 123.69M
+RESULT_JSON:{"device": "cpu", "strategy": "independent", "num_prompts": 8, "prefix_len": 256, "suffix_len": 16, "output_len": 4, "repeats": 5, "mean_ms": 1524.5367350002198, "std_ms": 28.27100921298063, "min_ms": 1488.7973479999346, "max_ms": 1549.1526419991715}
+Running device=cuda strategy=radix-shared prefix_len=32
+number of parameters: 123.69M
+RESULT_JSON:{"device": "cuda", "strategy": "radix-shared", "num_prompts": 8, "prefix_len": 32, "suffix_len": 16, "output_len": 4, "repeats": 5, "mean_ms": 167.51483459956944, "std_ms": 9.840442311452147, "min_ms": 156.97272899888048, "max_ms": 178.65719600013108, "cuda_peak_alloc_mb": 519.78076171875, "cuda_peak_reserved_mb": 566.0}
+Running device=cuda strategy=radix-shared prefix_len=128
+number of parameters: 123.69M
+RESULT_JSON:{"device": "cuda", "strategy": "radix-shared", "num_prompts": 8, "prefix_len": 128, "suffix_len": 16, "output_len": 4, "repeats": 5, "mean_ms": 175.8156644002156, "std_ms": 3.0998054528575847, "min_ms": 171.58242000004975, "max_ms": 179.36394900061714, "cuda_peak_alloc_mb": 600.40625, "cuda_peak_reserved_mb": 642.0}
+Running device=cuda strategy=radix-shared prefix_len=256
+number of parameters: 123.69M
+RESULT_JSON:{"device": "cuda", "strategy": "radix-shared", "num_prompts": 8, "prefix_len": 256, "suffix_len": 16, "output_len": 4, "repeats": 5, "mean_ms": 206.33794159984973, "std_ms": 12.478742110742372, "min_ms": 187.88220199894567, "max_ms": 223.0206710009952, "cuda_peak_alloc_mb": 685.75390625, "cuda_peak_reserved_mb": 790.0}
+Running device=cuda strategy=independent prefix_len=32
+number of parameters: 123.69M
+RESULT_JSON:{"device": "cuda", "strategy": "independent", "num_prompts": 8, "prefix_len": 32, "suffix_len": 16, "output_len": 4, "repeats": 5, "mean_ms": 181.11654160020407, "std_ms": 17.973182295845337, "min_ms": 165.0470149998, "max_ms": 210.263004000808, "cuda_peak_alloc_mb": 491.68310546875, "cuda_peak_reserved_mb": 538.0}
+Running device=cuda strategy=independent prefix_len=128
+number of parameters: 123.69M
+RESULT_JSON:{"device": "cuda", "strategy": "independent", "num_prompts": 8, "prefix_len": 128, "suffix_len": 16, "output_len": 4, "repeats": 5, "mean_ms": 207.50869360017532, "std_ms": 7.597585257751375, "min_ms": 200.76946900007897, "max_ms": 218.86137900037284, "cuda_peak_alloc_mb": 514.32666015625, "cuda_peak_reserved_mb": 546.0}
+Running device=cuda strategy=independent prefix_len=256
+number of parameters: 123.69M
+RESULT_JSON:{"device": "cuda", "strategy": "independent", "num_prompts": 8, "prefix_len": 256, "suffix_len": 16, "output_len": 4, "repeats": 5, "mean_ms": 257.42903979989933, "std_ms": 7.152813846570461, "min_ms": 249.82709800133307, "max_ms": 268.53383599882363, "cuda_peak_alloc_mb": 524.00146484375, "cuda_peak_reserved_mb": 598.0}
